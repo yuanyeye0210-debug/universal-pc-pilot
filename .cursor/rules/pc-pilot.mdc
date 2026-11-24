@@ -1,0 +1,11 @@
+---
+description: Universal PC Pilot — CLI-first + MCP + fast-act desktop automation routing rules
+alwaysApply: true
+---
+
+# Universal PC Pilot (Cursor Rules)
+
+1. **工具调用四层优先级**：原生终端 CLI（`~/.local/bin`、`office-cli`、`markitdown`、`cli-hub`）> 垂直 MCP > 浏览器 MCP（`playwright` / `chrome-devtools`）> 桌面 GUI（`fast-act` / `windows-mcp`）。
+2. **大输出压缩**：长日志/批量命令优先用 `context-mode` 本地过滤压缩。
+3. **桌面操作铁律**：必须操作桌面原生客户端时，优先使用 `fast-act` 单轮批处理并加上 `-ReturnFocus`（自动弹回 Cursor 窗口）；通讯软件发消息必须带 `assertOcr` 本地 OCR 校验；检测到用户移动鼠标/按键立即让权等待 2.5 秒。
+4. 详细参数与本机已就绪 CLI 清单见 `skills/pc-pilot/SKILL.md` 与 `~/.pc-pilot/MACHINE_TOOLS.md`。

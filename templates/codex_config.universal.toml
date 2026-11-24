@@ -1,0 +1,17 @@
+# Universal PC Pilot — OpenAI Codex MCP 配置模板
+# 可合并至 ~/.codex/config.toml
+
+[mcp_servers.windows-mcp]
+command = "uvx"
+args = ["windows-mcp", "serve", "--no-control"]
+
+[mcp_servers.windows-mcp.env]
+WINDOWS_MCP_DISABLE_FLASH = "1"
+
+[mcp_servers.playwright-edge]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest", "--browser", "msedge"]
+
+[mcp_servers.context-mode]
+command = "npx"
+args = ["-y", "context-mode", "server"]
