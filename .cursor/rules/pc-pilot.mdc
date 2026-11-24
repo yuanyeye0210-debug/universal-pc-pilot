@@ -7,5 +7,6 @@ alwaysApply: true
 
 1. **工具调用四层优先级**：原生终端 CLI（`~/.local/bin`、`office-cli`、`markitdown`、`cli-hub`）> 垂直 MCP > 浏览器 MCP（`playwright` / `chrome-devtools`）> 桌面 GUI（`fast-act` / `windows-mcp`）。
 2. **大输出压缩**：长日志/批量命令优先用 `context-mode` 本地过滤压缩。
-3. **桌面操作铁律**：必须操作桌面原生客户端时，优先使用 `fast-act` 单轮批处理并加上 `-ReturnFocus`（自动弹回 Cursor 窗口）；通讯软件发消息必须带 `assertOcr` 本地 OCR 校验；检测到用户移动鼠标/按键立即让权等待 2.5 秒。
-4. 详细参数与本机已就绪 CLI 清单见 `skills/pc-pilot/SKILL.md` 与 `~/.pc-pilot/MACHINE_TOOLS.md`。
+3. **桌面操作铁律**：必须操作桌面原生客户端时，优先使用 `fast-act` 单轮批处理并加上 `-ReturnFocus`（自动弹回 Cursor 窗口）；优先 `readOcr` 免传大图；通讯软件发消息必须带 `assertOcr` 本地 OCR 校验；检测到用户移动鼠标/按键立即让权等待 2.5 秒。
+4. **临时文件零残留**：过程核验截图与中转文件复用单一临时路径覆盖，任务结束前必须删除全部 AI 生成的临时文件。
+5. 详细参数与本机已就绪 CLI 清单见 `skills/pc-pilot/SKILL.md` 与 `~/.pc-pilot/MACHINE_TOOLS.md`。
