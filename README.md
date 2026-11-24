@@ -4,6 +4,14 @@
 
 ---
 
+## 给 AI Agent 的全自动安装指令
+
+把下面这句话直接发给任意 AI Agent，它就会自己读完文档并一键装好：
+
+> 请读取 `https://raw.githubusercontent.com/yuanyeye0210-debug/universal-pc-pilot/main/AI_INSTALL.md` 并按照里面的步骤在我的电脑上全自动完成安装、MCP 配置合并与 `pc-doctor` 体检。
+
+---
+
 ## 核心解决什么问题？
 
 1. **拒绝慢吞吞的盲点截图**：建立「**原生 CLI（最高优先级）→ 垂直 MCP → 浏览器 MCP → 桌面 GUI 兜底**」四层漏斗，能用命令行 0.1 秒解决的绝不截图点鼠标。
