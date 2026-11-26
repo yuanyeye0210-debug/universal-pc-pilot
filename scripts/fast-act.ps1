@@ -74,6 +74,7 @@ public class FastWin32 {
     public const uint MOUSEEVENTF_WHEEL = 0x0800;
     public const int SW_MAXIMIZE = 3;
     public const int SW_RESTORE = 9;
+    [DllImport("kernel32.dll")] public static extern uint GetTickCount();
 }
 "@
 
@@ -187,7 +188,7 @@ function Test-UserIntervened {
     $dx = [Math]::Abs($pt.X - $script:expectedCursor.X)
     $dy = [Math]::Abs($pt.Y - $script:expectedCursor.Y)
     $tick = Get-LastInputTick
-    if ($dx -gt 6 -or $dy -gt 6 -or ($tick -ne $script:expectedInputTick -and [Math]::Abs([int64]$tick - [int64]$script:expectedInputTick) -gt 40)) {
+    if ($dx -gt 4 -or $dy -gt 4 -or ($tick -ne $script:expectedInputTick -and [Math]::Abs([int64]$tick - [int64]$script:expectedInputTick) -gt 40)) {
         return $true
     }
     return $false
@@ -214,9 +215,11 @@ function Escape-SendKeysText([string]$raw) {
 }
 
 function Save-TargetCapture {
+    param([IntPtr]$CaptureHwnd = [IntPtr]::Zero)
     if ($CapturePath -eq "") { return }
+    $hwnd = if ($CaptureHwnd -ne [IntPtr]::Zero -and [FastWin32]::IsWindow($CaptureHwnd)) { $CaptureHwnd } else { $script:targetHwnd }
     $rect = New-Object FastWin32+RECT
-    [FastWin32]::GetWindowRect($script:targetHwnd, [ref]$rect) | Out-Null
+    [FastWin32]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
     $w = [Math]::Max(1, $rect.Right - $rect.Left)
     $h = [Math]::Max(1, $rect.Bottom - $rect.Top)
     $bmp = New-Object System.Drawing.Bitmap($w, $h)
@@ -288,8 +291,25 @@ function Wait-UserIdleAndYield([int]$currentStep) {
             $idleTimer.Restart()
         }
     }
-    Save-TargetCapture
-    Write-Output "UserAssisted_IdleFor2500ms_PausedAtStep=$currentStep (请重新读取最新屏幕状态后无缝继续接力)"
+    $fgNow = [FastWin32]::GetForegroundWindow()
+    $fgPid = [uint32]0
+    [FastWin32]::GetWindowThreadProcessId($fgNow, [ref]$fgPid) | Out-Null
+    $fgProc = Get-Process -Id $fgPid -ErrorAction SilentlyContinue
+    $fgProcName = if ($fgProc) { $fgProc.ProcessName } else { "Unknown" }
+    $fgTitle = if ($fgProc) { $fgProc.MainWindowTitle } else { "" }
+    Save-TargetCapture -CaptureHwnd $fgNow
+    Write-Output "UserAssisted_IdleFor2500ms_PausedAtStep=$currentStep CurrentForegroundProcess=$fgProcName CurrentForegroundTitle='$fgTitle' (用户已介入操作，严禁按旧计划继续，请读取最新桌面/前景窗口状态后再重新规划下一步)"
+}
+
+function Test-UserActiveElsewhereBeforeStart {
+    $fg = [FastWin32]::GetForegroundWindow()
+    if ($fg -eq [IntPtr]::Zero -or $fg -eq $script:callerHwnd -or $fg -eq $script:targetHwnd) {
+        return $false
+    }
+    $lastTick = Get-LastInputTick
+    $nowTick = [FastWin32]::GetTickCount()
+    $elapsed = [int64](($nowTick - $lastTick) -band 0xFFFFFFFF)
+    return ($elapsed -ge 0 -and $elapsed -lt 2500)
 }
 
 function Activate-TargetWindow {
@@ -494,6 +514,11 @@ function Invoke-MouseClick([int]$x, [int]$y, [string]$kind) {
     Update-ScriptInputBaseline
 }
 
+if (Test-UserActiveElsewhereBeforeStart) {
+    Wait-UserIdleAndYield -currentStep 0
+    exit 0
+}
+
 Activate-TargetWindow
 Assert-TargetFocused
 
@@ -555,14 +580,23 @@ try {
                 Start-Sleep -Milliseconds 35
                 [FastWin32]::mouse_event([FastWin32]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
                 for ($i = 1; $i -le $steps; $i++) {
+                    if (Test-UserIntervened) {
+                        [FastWin32]::mouse_event([FastWin32]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+                        Wait-UserIdleAndYield -currentStep $step
+                        $yieldedToUser = $true
+                        break
+                    }
                     $ix = [int]($fromPt[0] + ($toPt[0] - $fromPt[0]) * ($i / $steps))
                     $iy = [int]($fromPt[1] + ($toPt[1] - $fromPt[1]) * ($i / $steps))
                     [FastWin32]::SetCursorPos($ix, $iy) | Out-Null
+                    Update-ScriptInputBaseline
                     Start-Sleep -Milliseconds 12
                 }
-                [FastWin32]::mouse_event([FastWin32]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
-                $script:lastClickScreen = @($toPt[0], $toPt[1])
-                Update-ScriptInputBaseline
+                if (-not $yieldedToUser) {
+                    [FastWin32]::mouse_event([FastWin32]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+                    $script:lastClickScreen = @($toPt[0], $toPt[1])
+                    Update-ScriptInputBaseline
+                }
             }
             "paste" {
                 $usedClipboard = $true

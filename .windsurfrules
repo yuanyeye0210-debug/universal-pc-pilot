@@ -1,6 +1,6 @@
-# Universal PC Pilot (Windsurf Rules)
+# Universal PC Pilot (Windsurf Rules v2.1.0)
 
 1. 严格遵循四层优先级：原生终端 CLI（`~/.local/bin`、`office-cli`、`markitdown`、`cli-hub`）> 垂直 MCP > 浏览器 MCP > `fast-act` / `windows-mcp` 桌面 GUI。
 2. 禁止用 `windows-mcp` 的 PowerShell 工具跑普通终端命令。
-3. 桌面操作优先单轮调用 `fast-act -ProcessName ... -ActionsJson '...' -ReturnFocus`，通讯软件发消息必带 `assertOcr` 顶栏校验。
-4. 完整参考见 `skills/pc-pilot/SKILL.md` 与 `~/.pc-pilot/MACHINE_TOOLS.md`。
+3. 桌面操作优先单轮调用 `fast-act -ProcessName ... -ActionsJson '...'`，通讯软件发消息必带 `assertOcr` 顶栏校验；中间步骤勿传 `-ReturnFocus`，仅任务全部完成时先 `ControlStatus(release=true)` 再弹回宿主窗口；用户触碰键鼠 0ms 立即让权等 2.5 秒，恢复前先 `Snapshot`/`Screenshot` 重查画面。
+4. 过程核验截图复用同一临时路径，任务结束前彻底删除临时文件；完整参考见 `skills/pc-pilot/SKILL.md` 与 `~/.pc-pilot/MACHINE_TOOLS.md`。

@@ -1,12 +1,16 @@
-# Universal PC Pilot — OpenAI Codex MCP 配置模板
-# 可合并至 ~/.codex/config.toml
+# Universal PC Pilot v2.1.0 — OpenAI Codex 通用 MCP 配置模板
+# 注意：本模板使用上游 uvx windows-mcp；若需完整 0ms 触碰让权 / RESCAN_REQUIRED / P 款三点隐藏系统指针，
+# 请先运行 scripts/setup-windows-mcp.ps1，然后直接合并自动生成的 ~/.pc-pilot/codex_config.ready.toml。
 
 [mcp_servers.windows-mcp]
 command = "uvx"
-args = ["windows-mcp", "serve", "--no-control"]
+args = ["windows-mcp", "serve", "--control", "--control-idle-timeout", "2.5", "--control-policy", "balanced"]
 
 [mcp_servers.windows-mcp.env]
 WINDOWS_MCP_DISABLE_FLASH = "1"
+WINDOWS_MCP_OVERLAY_MODE = "spinner"
+WINDOWS_MCP_YIELD_ON_ANY_INPUT = "1"
+WINDOWS_MCP_CONSENT_COUNTDOWN = "0"
 
 [mcp_servers.playwright-edge]
 command = "npx"

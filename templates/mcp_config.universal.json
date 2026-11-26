@@ -5,10 +5,17 @@
       "args": [
         "windows-mcp",
         "serve",
-        "--no-control"
+        "--control",
+        "--control-idle-timeout",
+        "2.5",
+        "--control-policy",
+        "balanced"
       ],
       "env": {
-        "WINDOWS_MCP_DISABLE_FLASH": "1"
+        "WINDOWS_MCP_DISABLE_FLASH": "1",
+        "WINDOWS_MCP_OVERLAY_MODE": "spinner",
+        "WINDOWS_MCP_YIELD_ON_ANY_INPUT": "1",
+        "WINDOWS_MCP_CONSENT_COUNTDOWN": "0"
       }
     },
     "playwright-edge": {

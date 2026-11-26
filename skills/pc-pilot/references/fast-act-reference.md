@@ -1,4 +1,4 @@
-# `fast-act` v2.0 参数与动作参考手册
+# `fast-act` v2.1 参数与动作参考手册
 
 ## 1. 命令行参数
 
@@ -14,7 +14,7 @@ fast-act -ProcessName <进程名> [-WindowTitle <标题关键字>] -ActionsJson 
 | `-CapturePath` | 可选，结束或让权时保存核验截图路径（自动内嵌 `100px` 刻度尺与红点准星） |
 | `-NoMaximize` | 可选，保持目标窗口当前大小，不自动最大化 |
 | `-NoRuler` | 可选，关闭核验截图上的坐标刻度尺 |
-| `-ReturnFocus` | 可选，操作完成后自动置顶弹回调用方 Agent/终端窗口 |
+| `-ReturnFocus` | 可选，操作完成后自动置顶弹回调用方 Agent/终端窗口（**仅在整个任务彻底完成时传入，多步骤中间过程勿传**） |
 | `-ReturnProcess` | 可选，显式指定弹回的进程名（如 `Cursor`、`Code`、`Antigravity`、`WindowsTerminal`） |
 
 ---
@@ -28,7 +28,7 @@ fast-act -ProcessName <进程名> [-WindowTitle <标题关键字>] -ActionsJson 
 | `rightclick` | 同上 | 右键单击 |
 | `clickName` | `name`, 可选 `button:"right"`, `double:true` | 通过 Windows UIA 按控件文本定位中心并点击 |
 | `scroll` | `clicks`（负数为向下滚，如 `-5`）, 可选 `rx, ry` | 在指定坐标或窗口中心滚动鼠标滚轮 |
-| `drag` | `fromRx, fromRy, toRx, toRy`（或 `fromX/Y, toX/Y`）, 可选 `steps` | 平滑拖拽（默认 10 步插值） |
+| `drag` | `fromRx, fromRy, toRx, toRy`（或 `fromX/Y, toX/Y`）, 可选 `steps` | 平滑拖拽（默认 10 步插值，每步均检测用户介入与 `>=4px` 防误触） |
 | `paste` | `text`, 可选 `clear: false` | 默认先 `Ctrl+A -> Backspace` 清空后粘贴，自动备份还原剪贴板 |
 | `typeText` | `text`, 可选 `clear: true` | 自动转义 `+ ^ % ~ ( ) { } [ ]` 逐字输入（专治禁粘贴密码框） |
 | `key` | `keys`（SendKeys 语法，如 `^f`, `{ENTER}`, `%{F4}`） | 发送快捷键或功能键 |
@@ -40,7 +40,14 @@ fast-act -ProcessName <进程名> [-WindowTitle <标题关键字>] -ActionsJson 
 
 ---
 
-## 3. 退出码说明
+## 3. 人机协同让权机制（v2.1 增强）
+
+- **启动前避让**：执行前若检测到用户刚操作键鼠不满 2.5 秒，会立即输出 `HumanActive` 并等待用户停手。
+- **执行中 4px 防误触与全链路检测**：鼠标移动超过 `4px`、点击、拖拽每步插值及 `wait` 分片均实时监听用户介入；一旦用户介入，立刻停手（不吞输入）并在停手满 `2.5 秒`后由 `Wait-UserIdleAndYield` **截取真实前台窗口**并输出当前前景进程名与窗口标题，方便 AI 接力重判。
+
+---
+
+## 4. 退出码说明
 
 - `0`：全部动作执行成功（或检测到用户介入后安全让权并等待 2.5s 完成交接）
 - `1`：未找到目标进程或窗口

@@ -3,11 +3,13 @@ name: pc-pilot
 description: >-
   Universal Windows PC automation & tool routing skill: CLI-first execution
   (CLI-Anything, Office/WPS silent COM, dev toolchains), vertical & browser MCP
-  coordination, context-mode output compression, and sub-second Win32/UIA/WinRT-OCR
-  desktop GUI control via fast-act.
+  coordination, context-mode output compression, patched Windows-MCP human handoff
+  (0ms touch-to-yield, 2.5s RESCAN_REQUIRED rescan gate, 3-dot wave spinner with
+  hidden system cursor), and sub-second Win32/UIA/WinRT-OCR desktop GUI control
+  via fast-act.
 ---
 
-# Universal PC Pilot（全通用电脑极速操控与 CLI + MCP 协同指南）
+# Universal PC Pilot v2.1.0（全通用电脑极速操控与人机协同指南）
 
 当你需要操控用户的 Windows 电脑、批量处理本地文件/办公文档、调试项目或操作桌面软件时，强制遵循以下路由优先级与执行规范。
 
@@ -36,10 +38,11 @@ description: >-
 
 ---
 
-## 2. 桌面 GUI 极速高准度操控铁律
+## 2. 桌面 GUI 极速高准度操控与人机协同铁律
 
-当必须进入第 4 层桌面操控时，优先使用本插件提供的 `fast-act`（已加入 `PATH`）进行单轮动作链批处理：
+当必须进入第 4 层桌面操控时，优先使用本插件提供的 `fast-act`（已加入 `PATH`）与增强版 `windows-mcp` 协同工作：
 
+- **无大边框 + P 款三点思考图标 + 隐藏系统鼠标箭头**：保持 `--control --control-idle-timeout 2.5 --control-policy balanced` 与 `WINDOWS_MCP_OVERLAY_MODE=spinner`、`WINDOWS_MCP_YIELD_ON_ANY_INPUT=1`、`WINDOWS_MCP_CONSENT_COUNTDOWN=0`、`WINDOWS_MCP_DISABLE_FLASH=1`；思考与操控桌面期间只在鼠标旁显示 44px 灰白三点波浪起伏思考动画并自动隐藏系统白色鼠标箭头，不显示屏幕四周大边框与顶部黑横幅。
 - **默认最大化与前台强校验**：激活目标窗口时默认最大化；每次点击/输入前自动校验前台 PID，若焦点被用户切走立即中止。
 - **已最大化窗口防刷掉浮层**：若目标窗口已处于前台且已最大化，`fast-act` 不会重复调用最大化，避免冲掉搜索下拉框或右键菜单。
 - **相对坐标 + 原生控件直达**：优先使用 `clickName`（Windows UIA 按控件文本直接点击）或窗口内相对坐标 `rx, ry`（越界自动拦截）；核验截图（`-CapturePath`）自带 `100px` 刻度标尺与红点准星。
@@ -48,10 +51,10 @@ description: >-
   在 `fast-act` 单次调用中串联：
   1. `{"type":"key","keys":"^f"}` → `{"type":"wait","ms":180}` → `{"type":"paste","text":"联系人名"}` → `{"type":"wait","ms":450}` → `{"type":"key","keys":"{ENTER}"}`
   2. `{"type":"wait","ms":200}` → `{"type":"assertOcr","rx":520,"ry":30,"w":500,"h":70,"contains":"联系人名"}`（50ms 本地 WinRT OCR 校验顶部标题栏，不匹配当场报错拦截！）
-  3. `{"type":"paste","text":"消息内容"}` → `{"type":"wait","ms":60}` → `{"type":"key","keys":"{ENTER}"}` + `-ReturnFocus`
+  3. `{"type":"paste","text":"消息内容"}` → `{"type":"wait","ms":60}` → `{"type":"key","keys":"{ENTER}"}`（仅当整个任务到此结束时才附带 `-ReturnFocus`）
 - **防串字与全类型剪贴板保护**：`paste` 默认先 `Ctrl+A -> Backspace` 清空（可通过 `"clear": false` 关闭），并在前后自动备份还原用户的文本/图片/文件剪贴板；涉及删除、支付、不可撤回发送等高危操作必须单步确认。
-- **2.5 秒触碰即让权**：检测到用户移动鼠标或按键时立即停手让权，待用户停手满 2.5 秒后截图接力。
-- **结束必弹回调用方 Agent 窗口**：加上 `-ReturnFocus` 参数（或单独运行 `focus-caller`），自动将当前操控的 Agent/IDE/终端窗口置顶弹回最前。
+- **触碰即停 + 2.5 秒让权 + 强制重查接力**：检测到用户移动鼠标、点击、滚轮或按键时 0ms 立即停手让权（不吞用户输入），思考动画消失并瞬间恢复系统指针；待用户停手满 2.5 秒后，必须先调用 `Snapshot` / `Screenshot` 检查当前电脑界面与用户协助点好的最新进度（否则底层返回 `RESCAN_REQUIRED` 硬拦截），再重新规划下一步，严禁盲目沿用旧计划。
+- **仅在任务完成时弹回宿主 Agent 窗口**：多步骤操控与思考期间**严禁**频繁弹回 Antigravity / 宿主窗口（勿传 `-ReturnFocus`、勿中途调用 `focus-caller`）；仅在整个任务彻底完成或必须由用户在聊天框回复时，先调用 `ControlStatus(release=true)` 释放控制并恢复指针，再弹回宿主窗口。
 - **临时文件零残留铁律**：执行过程中生成的核验截图与中转文件必须复用同一临时路径覆盖写入（如 `$env:TEMP\pc_pilot_verify.png`），**任务结束前必须彻底删除本次 AI 生成的全部临时文件**，不占用用户磁盘与内存。
 
 ---

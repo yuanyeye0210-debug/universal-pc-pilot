@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Universal PC Pilot 卸载脚本：清理插件生成的垫片与规则挂载，并还原备份。
+    Universal PC Pilot 卸载脚本：清理插件生成的垫片、原生插件目录与标记规则块，绝不覆盖用户自写守则。
 #>
 param(
     [switch]$KeepToolShims
@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = 'SilentlyContinue'
 $binDir = Join-Path $env:USERPROFILE ".local\bin"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 $coreShims = @('fast-act.cmd', 'focus-caller.cmd', 'office-cli.cmd', 'pc-doctor.cmd')
 foreach ($s in $coreShims) {
@@ -29,6 +30,7 @@ if (-not $KeepToolShims) {
 }
 
 foreach ($sk in @(
+    (Join-Path $env:USERPROFILE '.gemini\config\plugins\universal-pc-pilot'),
     (Join-Path $env:USERPROFILE '.gemini\skills\pc-pilot'),
     (Join-Path $env:USERPROFILE '.claude\skills\pc-pilot'),
     (Join-Path $env:USERPROFILE '.codex\skills\pc-pilot'),
@@ -36,15 +38,22 @@ foreach ($sk in @(
 )) {
     if (Test-Path -LiteralPath $sk) {
         Remove-Item -LiteralPath $sk -Recurse -Force
-        Write-Output "Removed skill: $sk"
+        Write-Output "Removed plugin/skill: $sk"
     }
 }
 
+# 安全移除 GEMINI.md 中的插件规则标记块，保留用户自己的全部守则
 $geminiMd = Join-Path $env:USERPROFILE '.gemini\GEMINI.md'
-$bakMd = Join-Path $env:USERPROFILE '.gemini\GEMINI.md.bak-pc-pilot'
-if (Test-Path -LiteralPath $bakMd) {
-    Move-Item -LiteralPath $bakMd -Destination $geminiMd -Force
-    Write-Output "Restored backup: $geminiMd"
+if (Test-Path -LiteralPath $geminiMd) {
+    $startMarker = "<!-- UNIVERSAL-PC-PILOT:START -->"
+    $endMarker = "<!-- UNIVERSAL-PC-PILOT:END -->"
+    $mdContent = [System.IO.File]::ReadAllText($geminiMd, $utf8NoBom)
+    $pattern = "(?s)(?:\r?\n---\r?\n\r?\n)?" + [regex]::Escape($startMarker) + ".*?" + [regex]::Escape($endMarker) + "\r?\n?"
+    if ($mdContent -match [regex]::Escape($startMarker)) {
+        $cleaned = [regex]::Replace($mdContent, $pattern, "").TrimEnd() + "`r`n"
+        [System.IO.File]::WriteAllText($geminiMd, $cleaned, $utf8NoBom)
+        Write-Output "Removed UNIVERSAL-PC-PILOT block from: $geminiMd"
+    }
 }
 
 Write-Output "Uninstall completed."

@@ -1,11 +1,12 @@
 {
   "name": "universal-pc-pilot",
-  "displayName": "Universal PC Pilot (全通用电脑极速操控与 CLI+MCP 协同引擎)",
-  "version": "2.0.0",
-  "description": "跨 Agent 通用的 Windows 电脑高效操控插件：CLI 优先四层漏斗、Office/WPS 双引擎静默 CLI、本机软件自动探测挂载、以及支持 Win32/UIA/WinRT-OCR 的 fast-act 极速桌面动作链。",
+  "displayName": "Universal PC Pilot (全通用电脑极速操控与人机协同插件)",
+  "version": "2.1.0",
+  "description": "跨 Agent 通用的 Windows 电脑高效操控插件：CLI 优先四层漏斗、Office/WPS 双引擎静默 CLI、本机软件自动探测挂载、增强版 Windows-MCP（0ms 触碰即停、2.5s 让权、RESCAN_REQUIRED 强制重查、P 款 44px 灰白三点隐藏系统指针思考动画）以及 fast-act 极速桌面动作链。",
   "author": {
     "name": "yuanyeye0210-debug"
   },
+  "homepage": "https://github.com/yuanyeye0210-debug/universal-pc-pilot",
   "repository": "https://github.com/yuanyeye0210-debug/universal-pc-pilot",
   "license": "MIT"
 }

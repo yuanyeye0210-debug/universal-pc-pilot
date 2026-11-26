@@ -1,7 +1,7 @@
 {
   "name": "universal-pc-pilot",
-  "version": "2.0.0",
-  "description": "Universal Windows PC automation plugin for AI agents: CLI-first routing, Office/WPS silent COM CLI, auto-bootstrapped local tool shims, and fast-act Win32/UIA/WinRT-OCR GUI engine.",
+  "version": "2.1.0",
+  "description": "Universal Windows PC automation & human-handoff plugin for AI agents: CLI-first routing, Office/WPS silent COM CLI, auto-bootstrapped local tool shims, patched Windows-MCP (0ms touch-to-yield, 2.5s RESCAN_REQUIRED rescan gate, 3-dot wave spinner with hidden system cursor), and fast-act GUI engine.",
   "repository": "https://github.com/yuanyeye0210-debug/universal-pc-pilot",
   "license": "MIT"
 }

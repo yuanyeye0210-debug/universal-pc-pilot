@@ -1,0 +1,1090 @@
+diff --git a/src/windows_mcp/__main__.py b/src/windows_mcp/__main__.py
+index eabf7de..0ae9c06 100755
+--- a/src/windows_mcp/__main__.py
++++ b/src/windows_mcp/__main__.py
+@@ -87,8 +87,10 @@ Workflow:
+ - Use WaitFor instead of repeated Snapshots when waiting for text, a window, or an element.
+ - Pass display=[i] or region=[l, t, r, b] to capture less and save tokens.
+ - AI control lasts until released: call ControlStatus with release=true when the desktop
+-  work is done or before waiting on the user. If the user takes back control, stop and
+-  check ControlStatus; do not fight the user for the mouse or keyboard.
++  work is done or before waiting on the user. If the user touches the mouse or keyboard,
++  AI stops immediately and waits 2.5 seconds idle, then requires a Snapshot/Screenshot
++  rescan (RESCAN_REQUIRED) before any input tool runs so you inspect the user's changes
++  first. Do not switch back to the host chat window until the whole task is finished.
+ 
+ PowerShell, FileSystem, Registry, and Process act on the real system with no undo. Confirm
+ destructive changes with the user first.
+@@ -379,6 +381,16 @@ def _build_mcp() -> FastMCP:
+         controller.policy = _control_config.policy
+         controller.idle_timeout_seconds = _control_config.idle_timeout_seconds
+         controller.consent_countdown_seconds = _control_config.consent_countdown_seconds
++        yield_env = os.getenv("WINDOWS_MCP_YIELD_ON_ANY_INPUT", "").strip().lower()
++        if yield_env in {"1", "true", "yes", "on"}:
++            controller.yield_on_any_input = True
++        elif yield_env in {"0", "false", "no", "off"}:
++            controller.yield_on_any_input = False
++        countdown_env = os.getenv("WINDOWS_MCP_CONSENT_COUNTDOWN", "").strip()
++        if countdown_env.isdigit():
++            val = int(countdown_env)
++            if 0 <= val <= 60:
++                controller.consent_countdown_seconds = val
+ 
+         try:
+             if controller.enabled:
+diff --git a/src/windows_mcp/desktop/control.py b/src/windows_mcp/desktop/control.py
+index 166bdd1..a51ef0d 100644
+--- a/src/windows_mcp/desktop/control.py
++++ b/src/windows_mcp/desktop/control.py
+@@ -115,6 +115,11 @@ class ControlCoordinator:
+         self._fast_takeover = False
+         self._fast_pending = False
+         self._rotating = False
++        self.yield_on_any_input: bool = False
++        self._needs_rescan: bool = False
++        self._had_ai_control: bool = False
++        self._ai_idle_release_seconds: float = 180.0
++        self._last_tool_activity: float = 0.0
+         self._pressed: set[int] = set()
+         self._mouse_down: set[int] = set()
+         self._delivered_keys: set[int] = set()
+@@ -207,7 +212,7 @@ class ControlCoordinator:
+         )
+         last_input = max(self._last_user, self._last_physical_event)
+         wait = max(0.0, last_input + self.idle_timeout_seconds - now) if state == "user" else 0.0
+-        return {
++        snapshot = {
+             "state": state,
+             "generation": self._generation,
+             "wait_seconds": wait,
+@@ -220,6 +225,72 @@ class ControlCoordinator:
+                 else {}
+             ),
+         }
++        if self.yield_on_any_input:
++            snapshot["needs_rescan"] = self._needs_rescan
++        return snapshot
++
++    @property
++    def needs_rescan(self) -> bool:
++        with self._lock:
++            return self._needs_rescan
++
++    @property
++    def last_physical_event(self) -> float:
++        return self._last_physical_event
++
++    def mark_ai_cursor(self, x: int, y: int) -> None:
++        """Record the cursor position set by AI so it is not misread as user motion."""
++        self._last_point = (int(x), int(y))
++
++    def enter_thinking(self, *, min_stamp: float | None = None) -> dict:
++        """Activate AI thinking indicator after a clean desktop capture."""
++        if not self.enabled or not self.yield_on_any_input:
++            return self.status()
++        if self._emergency:
++            self._mark_unavailable()
++            return self.status()
++        now = time.monotonic()
++        with self._lock:
++            changed = self._set_locked("unavailable") if self._emergency else self._tick_locked(now)
++            if (
++                self._stop.is_set()
++                or self._emergency
++                or self._pressed
++                or self._mouse_down
++                or self._fast_takeover
++                or self._fast_pending
++                or (min_stamp is not None and self._last_physical_event > min_stamp)
++            ):
++                if min_stamp is not None and self._last_physical_event > min_stamp:
++                    self._last_user = self._last_physical_event
++                    self._needs_rescan = True
++                    changed = self._set_locked("user") or changed
++                result = self._snapshot_locked(now)
++            elif self._state in ("ready", "ai"):
++                try:
++                    self.input_ledger.enable()
++                except RuntimeError:
++                    self._fail_open()
++                    changed = self._set_locked("unavailable") or changed
++                    result = self._snapshot_locked(now)
++                else:
++                    self._needs_rescan = False
++                    self._had_ai_control = True
++                    self._last_tool_activity = now
++                    changed = self._set_locked("ai") or changed
++                    result = self._snapshot_locked(now)
++            else:
++                result = self._snapshot_locked(now)
++        if changed:
++            if result["state"] == "ai":
++                self._begin_notification.active = True
++                try:
++                    self._notify(result)
++                finally:
++                    self._begin_notification.active = False
++            else:
++                self._notify(result)
++        return result
+ 
+     def status(self) -> dict:
+         if not self.enabled:
+@@ -310,6 +381,15 @@ class ControlCoordinator:
+         ):
+             # Time-bound the input suppression lease when an in-flight call stalls.
+             return self._set_locked("ready")
++        if (
++            self.yield_on_any_input
++            and self._state == "ai"
++            and self._active_calls == 0
++            and self._last_tool_activity > 0
++            and self._ai_idle_release_seconds > 0
++            and now - self._last_tool_activity >= self._ai_idle_release_seconds
++        ):
++            return self._set_locked("ready")
+         # Otherwise AI control ends on release(), a user takeover, or shutdown.
+         return False
+ 
+@@ -382,6 +462,8 @@ class ControlCoordinator:
+                     status["state"], "CONTROL_UNAVAILABLE"
+                 )
+                 raise ControlBlocked(code, status)
++            if self.yield_on_any_input and self._needs_rescan:
++                raise ControlBlocked("RESCAN_REQUIRED", self._snapshot_locked(now))
+             try:
+                 self.input_ledger.enable()  # Any failed release keeps the lease closed.
+             except RuntimeError:
+@@ -393,6 +475,8 @@ class ControlCoordinator:
+                 self.input_ledger.block_new()
+                 raise ControlBlocked("CONTROL_UNAVAILABLE", self._snapshot_locked(now))
+             changed = self._set_locked("ai") or changed
++            self._had_ai_control = True
++            self._last_tool_activity = now
+             self._active_calls += 1
+             if self._active_call_since is None:
+                 self._active_call_since = now
+@@ -454,6 +538,7 @@ class ControlCoordinator:
+     def end_call(self, token: int) -> None:
+         with self._lock:
+             self._active_calls = max(0, self._active_calls - 1)
++            self._last_tool_activity = time.monotonic()
+             if self._active_calls == 0:
+                 self._active_call_since = None
+ 
+@@ -490,6 +575,9 @@ class ControlCoordinator:
+         self._fast_takeover = False
+         self._fast_pending = False
+         self._rotating = False
++        self._needs_rescan = False
++        self._had_ai_control = False
++        self._last_tool_activity = 0.0
+         self._thread = threading.Thread(target=self._run, name="windows-mcp-input", daemon=True)
+         self._thread.start()
+         if not self._ready.wait(3.0) or self._startup_error:
+@@ -675,10 +763,22 @@ class ControlCoordinator:
+                     changed = self._set_locked("user") or changed
+                 # The tick above may expire the AI lease before this queued
+                 # takeover is consumed. Always acknowledge its fast-path flag.
+-                if kind == "hotkey":
++                if kind == "yield":
++                    self._last_user = now
++                    self._needs_rescan = True
++                    changed = self._set_locked("user") or changed
++                    self._fast_takeover = False
++                elif kind == "hotkey":
+                     self._last_user = now
+                     changed = self._set_locked("user") or changed
+                     self._fast_takeover = False
++                elif user_input and self.yield_on_any_input:
++                    if self._had_ai_control or self._state == "ai":
++                        self._needs_rescan = True
++                    self._last_user = now
++                    changed = self._set_locked("user") or changed
++                    if self._state == "user":
++                        self._fast_takeover = False
+                 elif user_input and self._state in ("ready", "user"):
+                     self._last_user = now
+                     changed = self._set_locked("user") or changed
+diff --git a/src/windows_mcp/desktop/control_hooks.py b/src/windows_mcp/desktop/control_hooks.py
+index a462487..be4fb29 100644
+--- a/src/windows_mcp/desktop/control_hooks.py
++++ b/src/windows_mcp/desktop/control_hooks.py
+@@ -1,6 +1,7 @@
+ """Fast physical-input hook callbacks; never wait for UI or MCP work."""
+ 
+ import ctypes
++import math
+ import time
+ from typing import Any
+ 
+@@ -15,6 +16,21 @@ from windows_mcp.desktop.control_win32 import (
+ )
+ 
+ 
++def _trigger_instant_yield(owner: Any, now: float) -> bool:
++    """Immediately yield AI control on physical input without swallowing events."""
++    owner._last_physical_event = now
++    if getattr(owner, "_state", None) == "ai" or getattr(owner, "_suppress", False):
++        owner._fast_takeover = True
++        owner._suppress = False
++        owner._needs_rescan = True
++        owner.input_ledger.block_new()
++        owner._queue(("yield",))
++        return True
++    if getattr(owner, "_had_ai_control", False):
++        owner._needs_rescan = True
++    return False
++
++
+ def physical_mouse(owner: Any, code: int, wparam: int, lparam: int) -> int:
+     """Handle a physical mouse hook callback without waiting on other threads."""
+     if code < 0:
+@@ -31,23 +47,41 @@ def physical_mouse(owner: Any, code: int, wparam: int, lparam: int) -> int:
+             return _user32.CallNextHookEx(owner._mouse_hook, code, wparam, lparam)
+         valid = True
+         button = _mouse_button(wparam, data.mouseData)
++        is_wheel = wparam in (0x20A, 0x20E)
++        prev_point = owner._last_point
++        moved = (
++            prev_point is not None
++            and math.hypot(point[0] - prev_point[0], point[1] - prev_point[1]) >= 4.0
++        )
+         # Some wireless receivers stream WM_MOUSEMOVE at an unchanged position
+         # for as long as they are powered. Counting that as user activity keeps
+         # the coordinator in "user" forever, so only a button or real cursor
+         # displacement counts. Motion is still swallowed, but does not interrupt
+         # AI until the raw accumulator confirms a deliberate takeover.
+-        active = button is not None or point != owner._last_point
+-        owner._last_point = point
++        yield_any = bool(getattr(owner, "yield_on_any_input", False))
++        active = (
++            (button is not None or is_wheel or moved)
++            if yield_any
++            else (button is not None or is_wheel or point != prev_point)
++        )
++        if not yield_any or active or prev_point is None:
++            owner._last_point = point
+         if active:
+-            owner._last_physical_event = time.monotonic()
++            now = time.monotonic()
++            if yield_any:
++                yielded = _trigger_instant_yield(owner, now)
++                if not yielded:
++                    owner._queue(("point", data.pt.x, data.pt.y, int(wparam)))
++            else:
++                owner._last_physical_event = now
+         if button:
+             if button[1]:
+                 owner._mouse_down.add(button[0])
+             else:
+                 owner._mouse_down.discard(button[0])
+-        if active:
++        if active and not yield_any:
+             owner._queue(("point", data.pt.x, data.pt.y, int(wparam)))
+-        if owner._suppress and not owner._emergency:
++        if not yield_any and owner._suppress and not owner._emergency:
+             if time.monotonic() <= owner._deadline:
+                 return 1
+             owner._fail_open()
+@@ -74,7 +108,9 @@ def physical_key(owner: Any, code: int, wparam: int, lparam: int) -> int:
+         data = ctypes.cast(lparam, ctypes.POINTER(_KeyHookData)).contents
+         if data.flags & 0x10:  # LLKHF_INJECTED: AI SendInput stays usable.
+             return _user32.CallNextHookEx(owner._key_hook, code, wparam, lparam)
+-        owner._last_physical_event = time.monotonic()
++        now = time.monotonic()
++        yield_any = bool(getattr(owner, "yield_on_any_input", False))
++        owner._last_physical_event = now
+         vk = int(data.vkCode)
+         down = wparam in (0x100, 0x104)
+         # Japanese Hankaku/Zenkaku emits VK_DBE_SBCSCHAR / VK_DBE_DBCSCHAR
+@@ -87,6 +123,17 @@ def physical_key(owner: Any, code: int, wparam: int, lparam: int) -> int:
+                 owner._pressed.add(vk)
+             else:
+                 owner._pressed.discard(vk)
++        if yield_any:
++            if not _trigger_instant_yield(owner, now):
++                owner._queue(("key",))
++            result = _user32.CallNextHookEx(owner._key_hook, code, wparam, lparam)
++            if vk is not None and not mode_switch:
++                if down:
++                    if not result:
++                        owner._delivered_keys.add(vk)
++                else:
++                    owner._delivered_keys.discard(vk)
++            return result
+         if vk in owner._quarantine:
+             if not down:
+                 owner._quarantine.discard(vk)
+@@ -130,6 +177,10 @@ def raw_input(owner: Any, lparam: int) -> None:
+         return  # Null devices can be touchpads; do not infer source.
+     if not raw[1] and not raw[2]:
+         return  # A zero-delta report is device chatter, not user activity.
+-    owner._last_physical_event = time.monotonic()
++    now = time.monotonic()
++    owner._last_physical_event = now
++    if getattr(owner, "yield_on_any_input", False) and math.hypot(raw[1], raw[2]) >= 4.0:
++        if _trigger_instant_yield(owner, now):
++            return
+     # Preserve arrival time: queue latency must not join separate gestures.
+-    owner._queue(("raw", *raw, owner._last_physical_event))
++    owner._queue(("raw", *raw, now))
+diff --git a/src/windows_mcp/desktop/control_overlay.py b/src/windows_mcp/desktop/control_overlay.py
+index be9e903..8fff6f0 100644
+--- a/src/windows_mcp/desktop/control_overlay.py
++++ b/src/windows_mcp/desktop/control_overlay.py
+@@ -8,6 +8,7 @@ from collections.abc import Callable
+ from contextlib import contextmanager
+ import ctypes
+ import logging
++import os
+ import threading
+ import time
+ from ctypes import wintypes
+@@ -19,12 +20,14 @@ from windows_mcp.desktop.control_overlay_art import (
+     _NOTICE_GLOW_PAD,
+     _RIPPLE_FRAMES,
+     _RIPPLE_SIZE,
++    _SPINNER_SIZE,
+     _breath_opacity,
+     _cursor_bitmap,
+     _edge_bitmap,
+     _notice_bitmap,
+     _notice_glow_bitmap,
+     _ripple_frames,
++    _spinner_frames,
+ )
+ from windows_mcp import uia
+ 
+@@ -50,6 +53,25 @@ _user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+ _user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+ _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+ _user32.IsWindowVisible.restype = wintypes.BOOL
++_user32.CreateCursor.argtypes = [
++    wintypes.HINSTANCE,
++    ctypes.c_int,
++    ctypes.c_int,
++    ctypes.c_int,
++    ctypes.c_int,
++    ctypes.c_void_p,
++    ctypes.c_void_p,
++]
++_user32.CreateCursor.restype = wintypes.HANDLE
++_user32.SetSystemCursor.argtypes = [wintypes.HANDLE, wintypes.DWORD]
++_user32.SetSystemCursor.restype = wintypes.BOOL
++_user32.SystemParametersInfoW.argtypes = [
++    wintypes.UINT,
++    wintypes.UINT,
++    ctypes.c_void_p,
++    wintypes.UINT,
++]
++_user32.SystemParametersInfoW.restype = wintypes.BOOL
+ # Private DLL objects: argtypes on ctypes.windll.user32 would be process-global.
+ _wait_user32 = ctypes.WinDLL("user32", use_last_error=True)
+ _wait_user32.MsgWaitForMultipleObjectsEx.argtypes = [
+@@ -161,6 +183,46 @@ class _Layer:
+             self.hwnd = None
+ 
+ 
++_SPI_SETCURSORS = 0x0057
++_OCR_IDS = (32512, 32513, 32514, 32649, 32650)
++_cursor_hidden = False
++
++
++def _hide_system_cursor() -> None:
++    """Replace standard system cursors with a transparent cursor while AI indicator is shown."""
++    global _cursor_hidden
++    if _cursor_hidden:
++        return
++    try:
++        and_mask = (ctypes.c_ubyte * 128)(*([0xFF] * 128))
++        xor_mask = (ctypes.c_ubyte * 128)(*([0x00] * 128))
++        for ocr_id in _OCR_IDS:
++            hcur = _user32.CreateCursor(None, 0, 0, 32, 32, and_mask, xor_mask)
++            if hcur:
++                _user32.SetSystemCursor(hcur, ocr_id)
++        _cursor_hidden = True
++    except Exception:
++        logger.debug("could not hide system cursor", exc_info=True)
++
++
++def _restore_system_cursor() -> None:
++    """Restore standard Windows system cursors immediately."""
++    global _cursor_hidden
++    if not _cursor_hidden:
++        return
++    try:
++        _user32.SystemParametersInfoW(_SPI_SETCURSORS, 0, None, 0)
++    except Exception:
++        logger.debug("could not restore system cursor", exc_info=True)
++    finally:
++        _cursor_hidden = False
++
++
++def _overlay_mode() -> str:
++    mode = os.getenv("WINDOWS_MCP_OVERLAY_MODE", "full").strip().lower()
++    return "spinner" if mode == "spinner" else "full"
++
++
+ def _monitor_rects() -> tuple[tuple[int, int, int, int], ...]:
+     return tuple((r.left, r.top, r.right, r.bottom) for r in uia.GetMonitorsRect())
+ 
+@@ -180,6 +242,21 @@ def _build_layers(
+     if not rects:
+         raise RuntimeError("no display available for AI control indicator")
+     color = _AMBER if pending else _BLUE
++    if _overlay_mode() == "spinner":
++        point = wintypes.POINT()
++        if not _user32.GetCursorPos(ctypes.byref(point)):
++            raise RuntimeError("cannot locate cursor for AI control indicator")
++        frames = _spinner_frames(color)
++        ring = _Layer(
++            point.x - _SPINNER_SIZE // 2,
++            point.y - _SPINNER_SIZE // 2,
++            _SPINNER_SIZE,
++            _SPINNER_SIZE,
++            frames[0],
++            "cursor",
++            breathes=False,
++        )
++        return [], ring
+     layers: list[_Layer] = []
+     try:
+         for index, (left, top, right, bottom) in enumerate(rects):
+@@ -426,6 +503,8 @@ class _Indicator:
+     def _run(self) -> None:
+         layers: list[_Layer] = []
+         ring: _Layer | None = None
++        spinner_frames: list[bytes] = []
++        spinner_mode = False
+         ripple_layer: _Layer | None = None
+         ripple_frames: list[bytes] = []
+         ripple_point = (0, 0)
+@@ -465,9 +544,11 @@ class _Indicator:
+                         if ring:
+                             ring.close()
+                             ring = None
++                        spinner_mode = _overlay_mode() == "spinner"
+                         layers, ring = _build_layers(
+                             current_rects, amber, beat=self._beat, notice=active
+                         )
++                        spinner_frames = _spinner_frames(_AMBER if amber else _BLUE) if spinner_mode else []
+                         rects, mode = current_rects, (amber, active)
+                         visible = False
+                     if suspended:
+@@ -476,30 +557,52 @@ class _Indicator:
+                                 layer.hide()
+                             ring.hide()
+                             visible = False
++                            if spinner_mode:
++                                _restore_system_cursor()
+                     else:
+-                        opacity = _breath_opacity(time.monotonic() - breath_started)
+-                        for layer in layers:
+-                            if layer.breathes:
+-                                layer.set_opacity(opacity)
+-                        if not amber:
+-                            ring.set_opacity(opacity)
+-                        if not visible:
+-                            for layer in layers:
+-                                layer.show()
+-                            if not amber:
+-                                ring.show()
+-                            visible = True
+-                        if not amber:
++                        if spinner_mode and not amber and spinner_frames:
++                            idx = int((time.monotonic() - breath_started) * len(spinner_frames)) % len(spinner_frames)
+                             point = wintypes.POINT()
+                             if _user32.GetCursorPos(ctypes.byref(point)):
+-                                ring.move(point.x - _CURSOR_SIZE // 2, point.y - _CURSOR_SIZE // 2)
++                                ring.draw(
++                                    spinner_frames[idx],
++                                    point.x - _SPINNER_SIZE // 2,
++                                    point.y - _SPINNER_SIZE // 2,
++                                )
++                                if not visible:
++                                    ring.show()
++                                    _hide_system_cursor()
++                                    visible = True
++                            elif visible:
++                                ring.hide()
++                                _restore_system_cursor()
++                                visible = False
+                         else:
+-                            ring.hide()
++                            opacity = _breath_opacity(time.monotonic() - breath_started)
++                            for layer in layers:
++                                if layer.breathes:
++                                    layer.set_opacity(opacity)
++                            if not amber:
++                                ring.set_opacity(opacity)
++                            if not visible:
++                                for layer in layers:
++                                    layer.show()
++                                if not amber:
++                                    ring.show()
++                                visible = True
++                            if not amber:
++                                point = wintypes.POINT()
++                                if _user32.GetCursorPos(ctypes.byref(point)):
++                                    ring.move(point.x - _CURSOR_SIZE // 2, point.y - _CURSOR_SIZE // 2)
++                            else:
++                                ring.hide()
+                 elif visible:
+                     for layer in layers:
+                         layer.hide()
+                     if ring:
+                         ring.hide()
++                    if spinner_mode:
++                        _restore_system_cursor()
+                     visible = False
+                 if ripple is not None:
+                     ripple_point, ripple_start = ripple, time.monotonic()
+@@ -551,6 +654,7 @@ class _Indicator:
+                 self.error = exc
+                 self.condition.notify_all()
+         finally:
++            _restore_system_cursor()
+             self.started.set()
+             for layer in reversed(layers):
+                 layer.close()
+diff --git a/src/windows_mcp/desktop/control_overlay_art.py b/src/windows_mcp/desktop/control_overlay_art.py
+index bd64d82..bc0715b 100644
+--- a/src/windows_mcp/desktop/control_overlay_art.py
++++ b/src/windows_mcp/desktop/control_overlay_art.py
+@@ -11,6 +11,8 @@ from windows_mcp.desktop.overlay_bitmap import premultiplied_bgra
+ _BORDER = 56
+ _CURSOR_SIZE = 88
+ _CURSOR_LABEL = "AI"
++_SPINNER_SIZE = 44
++_SPINNER_FRAMES = 16
+ _RIPPLE_SIZE = 96
+ _RIPPLE_FRAMES = 9
+ _FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+@@ -102,6 +104,46 @@ def _draw_cursor_label(image: Image.Image, color: tuple[int, int, int]) -> None:
+     )
+ 
+ 
++def _spinner_frames(color: tuple[int, int, int]) -> list[bytes]:
++    """Render 16 frames of SpinKit-style 3-dot gray thinking wave (style P)."""
++    scale = 2
++    size = _SPINNER_SIZE * scale
++    half = (size - 1) / 2.0
++    dot_color = (145, 152, 165)
++    rim_color = (70, 76, 88)
++    offsets_x = (-12.0 * scale, 0.0, 12.0 * scale)
++
++    frames: list[bytes] = []
++    for frame_idx in range(_SPINNER_FRAMES):
++        phase = frame_idx * (2.0 * math.pi / _SPINNER_FRAMES)
++        image = Image.new("RGBA", (size, size), (*dot_color, 0))
++        px = image.load()
++        for idx, dx in enumerate(offsets_x):
++            wave = 0.5 * (1.0 + math.sin(phase - idx * (2.0 * math.pi / 3.0)))
++            dot_r = (2.4 + 2.6 * wave) * scale
++            a_peak = round(90 + 145 * wave)
++            cx = half + dx
++            cy = half
++            x0 = max(0, int(cx - dot_r - 2 * scale))
++            x1 = min(size, int(cx + dot_r + 2 * scale + 1))
++            y0 = max(0, int(cy - dot_r - 2 * scale))
++            y1 = min(size, int(cy + dot_r + 2 * scale + 1))
++            for y in range(y0, y1):
++                for x in range(x0, x1):
++                    dist = math.hypot(x - cx, y - cy)
++                    if dist <= dot_r + scale:
++                        cov = min(1.0, max(0.0, (dot_r + scale - dist) / scale))
++                        # Subtle outer rim makes gray dots crisp on pure white backgrounds.
++                        is_rim = dist > dot_r - 0.6 * scale
++                        c = rim_color if is_rim else dot_color
++                        alpha = round((a_peak * (0.55 if is_rim else 1.0)) * cov)
++                        if alpha > px[x, y][3]:
++                            px[x, y] = (*c, alpha)
++        downsampled = image.resize((_SPINNER_SIZE, _SPINNER_SIZE), Image.Resampling.LANCZOS)
++        frames.append(premultiplied_bgra(downsampled, 1.0))
++    return frames
++
++
+ def _ripple_frames(color: tuple[int, int, int]) -> list[bytes]:
+     """Render an expanding, fading ring that marks where AI clicked."""
+     scale = 4  # Supersample so the thin ring stays smooth after downsizing.
+diff --git a/src/windows_mcp/desktop/flash_overlay.py b/src/windows_mcp/desktop/flash_overlay.py
+index d4314e9..9d8b2e5 100644
+--- a/src/windows_mcp/desktop/flash_overlay.py
++++ b/src/windows_mcp/desktop/flash_overlay.py
+@@ -52,8 +52,8 @@ _all_overlays: set["_Overlay"] = set()
+ 
+ 
+ def _flash_disabled() -> bool:
+-    value = os.getenv("WINDOWS_MCP_DISABLE_FLASH", "")
+-    return value.strip().lower() in {"1", "true", "yes", "on"}
++    value = os.getenv("WINDOWS_MCP_DISABLE_FLASH", "1")
++    return value.strip().lower() not in {"0", "false", "no", "off"}
+ 
+ 
+ class _Overlay:
+diff --git a/src/windows_mcp/desktop/service.py b/src/windows_mcp/desktop/service.py
+index 4200b87..53496f2 100644
+--- a/src/windows_mcp/desktop/service.py
++++ b/src/windows_mcp/desktop/service.py
+@@ -816,6 +816,8 @@ class Desktop:
+         self._validate_screen_point(x, y)
+         if clicks == 0:
+             owner.checkpoint_current()
++            if hasattr(owner, "mark_ai_cursor"):
++                owner.mark_ai_cursor(x, y)
+             uia.SetCursorPos(x, y)
+             return ""
+         # Ask before clicking: a click that opens its own dialog must not look blocked.
+@@ -827,20 +829,31 @@ class Desktop:
+                     dbl_wait = uia.GetDoubleClickTime() / 2000.0
+                     for i in range(clicks):
+                         owner.checkpoint_current()
++                        if hasattr(owner, "mark_ai_cursor"):
++                            owner.mark_ai_cursor(x, y)
+                         uia.Click(x, y, waitTime=dbl_wait if i < clicks - 1 else 0.5)
+                         owner.record_step_current()
+                 else:
+                     owner.checkpoint_current()
+-                    uia.Click(x, y)
++                    if hasattr(owner, "mark_ai_cursor"):
++                        owner.mark_ai_cursor(x, y)
++                    try:
++                        uia.Click(x, y, waitTime=0.1)
++                    except TypeError:
++                        uia.Click(x, y)
+                     owner.record_step_current()
+             case "right":
+                 for _ in range(clicks):
+                     owner.checkpoint_current()
++                    if hasattr(owner, "mark_ai_cursor"):
++                        owner.mark_ai_cursor(x, y)
+                     uia.RightClick(x, y)
+                     owner.record_step_current()
+             case "middle":
+                 for _ in range(clicks):
+                     owner.checkpoint_current()
++                    if hasattr(owner, "mark_ai_cursor"):
++                        owner.mark_ai_cursor(x, y)
+                     uia.MiddleClick(x, y)
+                     owner.record_step_current()
+         return blocked
+@@ -853,7 +866,7 @@ class Desktop:
+     # paste path is reliable because it bypasses the scan-code queue
+     # entirely. Plain-text only; control chars route through SendKeys
+     # so escape sequences ({Enter}, {Tab}, …) still work.
+-    _LONG_TEXT_PASTE_THRESHOLD = 20
++    _LONG_TEXT_PASTE_THRESHOLD = 4
+ 
+     def type(
+         self,
+@@ -874,7 +887,9 @@ class Desktop:
+         owner.checkpoint_current()
+         x, y = loc
+         self._validate_screen_point(x, y)
+-        uia.Click(x, y)
++        if hasattr(owner, "mark_ai_cursor"):
++            owner.mark_ai_cursor(x, y)
++        uia.Click(x, y, waitTime=0.1)
+         owner.record_step_current()
+         if caret_position in ("start", "end"):
+             key = "{Home}" if caret_position == "start" else "{End}"
+@@ -891,7 +906,7 @@ class Desktop:
+         notes: list[str] = []
+         target = None
+         if clear:
+-            sleep(0.5)
++            sleep(0.1)
+             target = self._focused_control()
+             notes.append(self._clear_field(target))
+         # Per-key SendKeys for short text (so escape sequences keep working);
+@@ -1262,6 +1277,8 @@ class Desktop:
+         else:
+             cx, cy = normalized_from_loc
+         try:
++            if hasattr(owner, "mark_ai_cursor"):
++                owner.mark_ai_cursor(cx, cy)
+             owner.input_ledger.press(
+                 "mouse:left",
+                 lambda: uia.PressMouse(cx, cy, waitTime=0.05),
+@@ -1278,9 +1295,11 @@ class Desktop:
+             interval = 0.01 if effective_duration is None else effective_duration / steps
+             for step in range(1, steps + 1):
+                 owner.checkpoint_current()
+-                uia.SetCursorPos(
+-                    cx + round((x - cx) * step / steps), cy + round((y - cy) * step / steps)
+-                )
++                nx = cx + round((x - cx) * step / steps)
++                ny = cy + round((y - cy) * step / steps)
++                if hasattr(owner, "mark_ai_cursor"):
++                    owner.mark_ai_cursor(nx, ny)
++                uia.SetCursorPos(nx, ny)
+                 owner.record_step_current()
+                 if interval:
+                     sleep(interval)
+@@ -1297,7 +1316,11 @@ class Desktop:
+         steps = max(1, min(80, max(abs(x - cx), abs(y - cy)) // 20))
+         for step in range(1, steps + 1):
+             owner.checkpoint_current()
+-            uia.SetCursorPos(cx + (x - cx) * step // steps, cy + (y - cy) * step // steps)
++            nx = cx + (x - cx) * step // steps
++            ny = cy + (y - cy) * step // steps
++            if hasattr(owner, "mark_ai_cursor"):
++                owner.mark_ai_cursor(nx, ny)
++            uia.SetCursorPos(nx, ny)
+             owner.record_step_current()
+             sleep(0.003)
+ 
+@@ -1329,6 +1352,8 @@ class Desktop:
+                 )
+             for x, y in points:
+                 owner.checkpoint_current()
++                if hasattr(owner, "mark_ai_cursor"):
++                    owner.mark_ai_cursor(x, y)
+                 uia.Click(x, y, waitTime=0.2)
+                 owner.record_step_current()
+                 sleep(0.5)
+diff --git a/src/windows_mcp/tools/control_notifications.py b/src/windows_mcp/tools/control_notifications.py
+index ff40558..4912af1 100644
+--- a/src/windows_mcp/tools/control_notifications.py
++++ b/src/windows_mcp/tools/control_notifications.py
+@@ -160,6 +160,54 @@ class ControlNotifier:
+             logger.debug("MCP control notification failed; session removed", exc_info=True)
+ 
+ 
++_BLOCKED_MESSAGES = {
++    "USER_CONTROL": (
++        "用户正在操作电脑（鼠标或键盘活动），已立即停止 AI 操作。禁止继续发送点击/输入动作！"
++        "请调用 Snapshot 或 Screenshot（将自动等待用户停手满 2.5 秒并抓取最新画面），"
++        "确认用户做了什么后再重新规划下一步。"
++    ),
++    "RESCAN_REQUIRED": (
++        "检测到用户刚刚接管并操作过电脑，界面状态可能已变化（用户可能已帮你完成部分步骤或切换了窗口）。"
++        "已硬拦截本次旧动作以防乱点乱输！请先调用 Snapshot 或 Screenshot 检查最新桌面状态，"
++        "再基于最新界面重新决定下一步。"
++    ),
++    "CONTROL_PREEMPTED": (
++        "动作执行中途检测到用户触碰鼠标/键盘，已毫秒级中止后续输入。"
++        "请调用 Snapshot 或 Screenshot 等待用户停手满 2.5 秒并重查最新界面，切勿盲目重试旧步骤。"
++    ),
++}
++
++_HANDOFF_SYNC_NOTICE = (
++    "[HUMAN_HANDOFF_SYNC] 检测到您此前暂停并由用户接管了电脑，现已等待用户停手满 2.5 秒并重新抓取最新屏幕状态。"
++    "请仔细检查当前前景窗口及界面内容（用户可能已协助完成了某些步骤或切换了窗口），"
++    "务必基于本次最新状态重新规划下一步，禁止盲目沿用旧计划或旧坐标。"
++)
++
++
++def _inject_handoff_notice(result: Any) -> Any:
++    """Prepend a human-handoff rescan notice to a Snapshot/Screenshot result."""
++    if isinstance(result, str):
++        return f"{_HANDOFF_SYNC_NOTICE}\n\n{result}"
++    if isinstance(result, list):
++        if result and isinstance(result[0], str):
++            return [f"{_HANDOFF_SYNC_NOTICE}\n\n{result[0]}", *result[1:]]
++        try:
++            from mcp.types import TextContent
++
++            return [TextContent(type="text", text=_HANDOFF_SYNC_NOTICE), *result]
++        except Exception:
++            return [_HANDOFF_SYNC_NOTICE, *result]
++    content = getattr(result, "content", None)
++    if isinstance(content, list):
++        try:
++            from mcp.types import TextContent
++
++            content.insert(0, TextContent(type="text", text=_HANDOFF_SYNC_NOTICE))
++        except Exception:
++            pass
++    return result
++
++
+ class ControlToolGate(Middleware):
+     """Apply one configured ownership policy at the MCP boundary."""
+ 
+@@ -177,12 +225,11 @@ class ControlToolGate(Middleware):
+ 
+     @staticmethod
+     def _blocked(exc: Exception) -> ToolError:
+-        return ToolError(
+-            json.dumps(
+-                {"code": exc.code, "status": exc.status},
+-                ensure_ascii=False,
+-            )
+-        )
++        payload: dict[str, Any] = {"code": exc.code, "status": exc.status}
++        msg = _BLOCKED_MESSAGES.get(exc.code)
++        if msg:
++            payload["message"] = msg
++        return ToolError(json.dumps(payload, ensure_ascii=False))
+ 
+     async def _begin_call(self, name: str) -> int:
+         """Wait for the visible lease off-loop, retaining ownership on cancel."""
+@@ -238,6 +285,27 @@ class ControlToolGate(Middleware):
+             # Keep shared desktop operations serialized, without creating a lease.
+             async with self._call_lock:
+                 return await call_next(context)
++        from windows_mcp.desktop.control import ControlBlocked
++
++        yield_any = bool(getattr(self.controller, "yield_on_any_input", False))
++        if yield_any and name in ("Snapshot", "Screenshot"):
++            deadline = time.monotonic() + 60.0
++            status = self.controller.status()
++            while status.get("state") == "user":
++                if time.monotonic() >= deadline:
++                    raise self._blocked(ControlBlocked("USER_CONTROL", status))
++                await asyncio.sleep(0.1)
++                status = self.controller.status()
++            was_rescan = bool(getattr(self.controller, "needs_rescan", False))
++            pre_stamp = float(getattr(self.controller, "last_physical_event", 0.0))
++            result = await call_next(context)
++            post_stamp = float(getattr(self.controller, "last_physical_event", 0.0))
++            if post_stamp <= pre_stamp and hasattr(self.controller, "enter_thinking"):
++                await asyncio.to_thread(self.controller.enter_thinking, min_stamp=pre_stamp)
++            if was_rescan:
++                result = _inject_handoff_notice(result)
++            return result
++
+         from windows_mcp.tools.control_policy import requires_control
+ 
+         if not requires_control(
+@@ -248,10 +316,15 @@ class ControlToolGate(Middleware):
+             return await call_next(context)
+         # Waiting behind an already running external command must not hide a
+         # user takeover. Poll ownership while waiting, then recheck under lock.
+-        from windows_mcp.desktop.control import ControlBlocked
+ 
+         def reject_user_state() -> None:
+             status = self.controller.status()
++            if (
++                yield_any
++                and status["state"] == "ready"
++                and getattr(self.controller, "needs_rescan", False)
++            ):
++                raise self._blocked(ControlBlocked("RESCAN_REQUIRED", status))
+             if status["state"] == "user" and self.ask_consent and self.controller.would_ask():
+                 return  # Ask the person at the desk instead of refusing silently.
+             if status["state"] not in ("ready", "ai"):
+diff --git a/tests/test_human_handoff_spinner.py b/tests/test_human_handoff_spinner.py
+new file mode 100644
+index 0000000..cef51e5
+--- /dev/null
++++ b/tests/test_human_handoff_spinner.py
+@@ -0,0 +1,216 @@
++"""Tests for instant human handoff, forced rescan gate, and spinner overlay."""
++
++from __future__ import annotations
++
++import ctypes
++import json
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++from fastmcp import Client, FastMCP
++
++from windows_mcp.desktop import control_hooks, control_overlay, control_overlay_art
++from windows_mcp.desktop.control import ControlBlocked, ControlCoordinator
++from windows_mcp.infrastructure.config import load_config
++from windows_mcp.tools.control_notifications import ControlNotifier, ControlToolGate
++
++
++def _make_ready_coordinator(*, idle_timeout: float = 0.15) -> ControlCoordinator:
++    coord = ControlCoordinator()
++    coord.enabled = True
++    coord.policy = "balanced"
++    coord.idle_timeout_seconds = idle_timeout
++    coord.yield_on_any_input = True
++    coord._state = "ai"
++    coord._suppress = True
++    coord._visual_armed = True
++    coord._had_ai_control = True
++    coord._deadline = time.monotonic() + 5.0
++    coord._last_point = (100, 100)
++    return coord
++
++
++def test_yield_on_any_input_never_swallows_and_sets_rescan(monkeypatch):
++    monkeypatch.setattr(control_hooks._user32, "CallNextHookEx", lambda *args: 0)
++
++    # 1. Mouse move >= 4px immediately yields without swallowing
++    coord = _make_ready_coordinator()
++    data = control_hooks._MouseHookData(
++        pt=control_hooks._user32.GetAsyncKeyState and ctypes.wintypes.POINT(105, 100),
++        mouseData=0,
++        flags=0,
++        time=0,
++        dwExtraInfo=0,
++    )
++    ret = control_hooks.physical_mouse(coord, 0, 0x200, ctypes.addressof(data))
++    assert ret == 0
++    assert coord._suppress is False
++    assert coord._needs_rescan is True
++    assert coord._fast_takeover is True
++    event = coord._events.get_nowait()
++    assert event[0] == "yield"
++    coord._handle(event)
++    assert coord.status()["state"] == "user"
++
++    # 2. Mouse click & wheel immediately yield without swallowing
++    for msg in (0x201, 0x20A):
++        coord2 = _make_ready_coordinator()
++        d2 = control_hooks._MouseHookData(
++            pt=ctypes.wintypes.POINT(100, 100),
++            mouseData=(120 << 16) if msg == 0x20A else 0,
++            flags=0,
++            time=0,
++            dwExtraInfo=0,
++        )
++        assert control_hooks.physical_mouse(coord2, 0, msg, ctypes.addressof(d2)) == 0
++        assert coord2._suppress is False
++        assert coord2._needs_rescan is True
++        assert coord2._events.get_nowait()[0] == "yield"
++
++    # 3. Any physical keyboard press immediately yields without swallowing
++    coord3 = _make_ready_coordinator()
++    kdata = control_hooks._KeyHookData(vkCode=0x41, scanCode=0x1E, flags=0, time=0, dwExtraInfo=0)
++    assert control_hooks.physical_key(coord3, 0, 0x100, ctypes.addressof(kdata)) == 0
++    assert coord3._suppress is False
++    assert coord3._needs_rescan is True
++    assert coord3._events.get_nowait()[0] == "yield"
++
++
++def test_rescan_required_blocks_action_until_enter_thinking():
++    coord = _make_ready_coordinator(idle_timeout=0.1)
++    coord.input_ledger.enable()
++    coord._handle(("yield",))
++    assert coord.status()["state"] == "user"
++    assert coord.needs_rescan is True
++
++    # Wait until idle_timeout expires -> state becomes ready, but RESCAN_REQUIRED still blocks.
++    time.sleep(0.15)
++    st = coord.status()
++    assert st["state"] == "ready"
++    assert st["needs_rescan"] is True
++
++    with pytest.raises(ControlBlocked) as exc:
++        coord.begin_call("Click")
++    assert exc.value.code == "RESCAN_REQUIRED"
++
++    # Simulate Snapshot/Screenshot completing cleanly.
++    res = coord.enter_thinking(min_stamp=coord.last_physical_event)
++    assert res["state"] == "ai"
++    assert res["needs_rescan"] is False
++
++    token = coord.begin_call("Click")
++    assert token > 0
++    coord.end_call(token)
++
++
++@pytest.mark.asyncio
++async def test_mcp_gate_waits_for_user_idle_rescan_and_blocks_blind_click():
++    coord = _make_ready_coordinator(idle_timeout=0.15)
++    coord.input_ledger.enable()
++    coord._handle(("yield",))
++
++    mcp = FastMCP("handoff-test")
++    notifier = ControlNotifier(coord)
++    mcp.add_middleware(ControlToolGate(coord, notifier))
++    clicked = []
++
++    @mcp.tool(name="Click")
++    def click_tool():
++        clicked.append(True)
++        return "clicked"
++
++    @mcp.tool(name="Snapshot")
++    def snapshot_tool():
++        return ["desktop state ok"]
++
++    async with Client(mcp) as client:
++        # 1. Calling Click while user is active -> USER_CONTROL
++        err1 = await client.call_tool("Click", raise_on_error=False)
++        assert err1.is_error
++        payload1 = json.loads(err1.content[0].text)
++        assert payload1["code"] == "USER_CONTROL"
++        assert "2.5 秒" in payload1["message"]
++
++        # 2. Wait for user idle timeout -> Click is still blocked by RESCAN_REQUIRED
++        time.sleep(0.2)
++        err2 = await client.call_tool("Click", raise_on_error=False)
++        assert err2.is_error
++        payload2 = json.loads(err2.content[0].text)
++        assert payload2["code"] == "RESCAN_REQUIRED"
++        assert "Snapshot" in payload2["message"]
++        assert clicked == []
++
++        # 3. Trigger user state again and call Snapshot -> waits for idle, returns handoff notice, enters ai thinking
++        coord._last_physical_event = time.monotonic()
++        coord._handle(("yield",))
++        snap = await client.call_tool("Snapshot")
++        assert "[HUMAN_HANDOFF_SYNC]" in str(snap.content[0].text)
++        assert coord.status()["state"] == "ai"
++        assert coord.needs_rescan is False
++
++        # 4. Now Click succeeds
++        ok = await client.call_tool("Click")
++        assert not ok.is_error
++        assert clicked == [True]
++
++
++def test_spinner_frames_and_overlay_mode(monkeypatch):
++    frames = control_overlay_art._spinner_frames(control_overlay._BLUE)
++    assert len(frames) == control_overlay_art._SPINNER_FRAMES == 16
++    expected_bytes = control_overlay_art._SPINNER_SIZE * control_overlay_art._SPINNER_SIZE * 4
++    assert all(len(f) == expected_bytes for f in frames)
++    assert len(set(frames)) == 16
++
++    created = []
++
++    class DummyLayer:
++        def __init__(self, x, y, w, h, bgra, name, *, breathes=True):
++            created.append((x, y, w, h, name, breathes))
++
++    monkeypatch.setenv("WINDOWS_MCP_OVERLAY_MODE", "spinner")
++    monkeypatch.setattr(control_overlay, "_Layer", DummyLayer)
++    monkeypatch.setattr(
++        control_overlay._user32,
++        "GetCursorPos",
++        lambda ptr: setattr(ptr._obj, "x", 300) or setattr(ptr._obj, "y", 400) or True,
++    )
++    layers, ring = control_overlay._build_layers(((0, 0, 1920, 1080),), pending=False)
++    assert layers == []
++    assert isinstance(ring, DummyLayer)
++    assert len(created) == 1
++    assert created[0][4] == "cursor"
++    assert created[0][2] == control_overlay_art._SPINNER_SIZE
++
++
++def test_system_cursor_hide_and_restore(monkeypatch):
++    calls = []
++    monkeypatch.setattr(control_overlay._user32, "CreateCursor", lambda *args: 12345)
++    monkeypatch.setattr(
++        control_overlay._user32,
++        "SetSystemCursor",
++        lambda h, ocr_id: calls.append(("set", h, ocr_id)) or True,
++    )
++    monkeypatch.setattr(
++        control_overlay._user32,
++        "SystemParametersInfoW",
++        lambda action, p1, p2, f: calls.append(("restore", action)) or True,
++    )
++    control_overlay._cursor_hidden = False
++    control_overlay._hide_system_cursor()
++    assert control_overlay._cursor_hidden is True
++    assert len([c for c in calls if c[0] == "set"]) == len(control_overlay._OCR_IDS)
++    control_overlay._restore_system_cursor()
++    assert control_overlay._cursor_hidden is False
++    assert ("restore", control_overlay._SPI_SETCURSORS) in calls
++
++
++def test_user_config_toml_loads_expected_settings():
++    cfg_path = Path("~/.windows-mcp/config.toml").expanduser()
++    cfg = load_config(cfg_path)
++    assert cfg.control.enabled is True
++    assert cfg.control.policy == "balanced"
++    assert cfg.control.idle_timeout_seconds == 2.5
++    assert cfg.control.consent_countdown_seconds == 0
++    assert cfg.control.mouse_takeover_units == 40
